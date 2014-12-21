@@ -18,6 +18,7 @@ package fuse4j.hadoopfs;
  */
 
 import java.nio.ByteBuffer;
+import fuse.FuseStatfsSetter;
 
 /**
  * interface HdfsClient
@@ -32,8 +33,10 @@ public interface HdfsClient {
      * @return Object --> hdfsFile, that should be passed to close()
      */
     public Object openForRead(String path);
+    
+    public Object openForWrite(String path);
 
-    public Object createForWrite(String path);
+    public boolean mknod(String path);
 
     public boolean close(Object hdfsFile);
 
@@ -48,4 +51,6 @@ public interface HdfsClient {
     public boolean rmdir(String dirPath);
 
     public boolean rename(String src, String dst);
+
+    public boolean statfs(FuseStatfsSetter statfsSetter, int blockSize, int namelen);
 }

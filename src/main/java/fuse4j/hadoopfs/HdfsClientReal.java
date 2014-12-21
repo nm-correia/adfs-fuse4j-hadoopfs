@@ -18,12 +18,16 @@ package fuse4j.hadoopfs;
  */
 
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.ContentSummary;
 import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.FSDataOutputStream;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.FsStatus;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.fs.permission.FsPermission;
+
+import fuse.FuseStatfsSetter;
 
 import java.io.IOException;
 import java.net.URI;
@@ -44,6 +48,9 @@ class HdfsClientReal implements HdfsClient {
         this.userCache = userCache;
         try {
             Configuration conf = new Configuration();
+            // Small cluster
+            // http://community.cloudera.com/t5/Storage-Random-Access-HDFS/Where-can-I-set-dfs-client-block-write-replace-datanode-on/td-p/2529
+            conf.set("dfs.client.block.write.replace-datanode-on-failure.policy", "NEVER");
             dfs = FileSystem.get(new URI(hdfsUrl), conf);
         } catch(URISyntaxException e) {
             throw new IOException("URL Issue");
@@ -58,7 +65,7 @@ class HdfsClientReal implements HdfsClient {
         try {
             FileStatus dfsStat = dfs.getFileStatus(new Path(path));
 
-            final boolean directory = dfsStat.isDir();
+            final boolean directory = dfsStat.isDirectory();
             final int inode = 0;
             final int mode = dfsStat.getPermission().toShort();
             final int uid = userCache.getUid(dfsStat.getOwner());
@@ -68,7 +75,7 @@ class HdfsClientReal implements HdfsClient {
             // TODO: per-file block-size can't be retrieved correctly,
             //       using default block size for now.
             final long size = dfsStat.getLen();
-            final int blocks = (int) Math.ceil(((double) size) / dfs.getDefaultBlockSize());
+            final int blocks = (int) Math.ceil(((double) size) / dfsStat.getBlockSize());
 
             // modification/create-times are the same as access-time
             final int modificationTime = (int) (dfsStat.getModificationTime() / 1000);
@@ -113,7 +120,7 @@ class HdfsClientReal implements HdfsClient {
     }
 
     private HdfsDirEntry newHdfsDirEntry(FileStatus fileStatus) {
-        final boolean directory = fileStatus.isDir();
+        final boolean directory = fileStatus.isDirectory();
         final String name = fileStatus.getPath().getName();
         final FsPermission permission = fileStatus.getPermission();
 
@@ -127,7 +134,25 @@ class HdfsClientReal implements HdfsClient {
         try {
             FSDataInputStream input = dfs.open(new Path(path));
 
-            return new HdfsFileIoContext(input);
+            return new HdfsFileIoContext(input, 0);
+        } catch(IOException ioe) {
+            // fall through to failure
+        }
+
+        return null;
+    }
+    
+    
+    /**
+     * openForWrite()
+     */
+    public Object openForWrite(String path) {
+        try {
+            FSDataOutputStream output = dfs.append(new Path(path));
+            
+            long len = dfs.getFileStatus(new Path(path)).getLen();
+
+            return new HdfsFileIoContext(output, len);
         } catch(IOException ioe) {
             // fall through to failure
         }
@@ -135,17 +160,30 @@ class HdfsClientReal implements HdfsClient {
         return null;
     }
 
-    public Object createForWrite(String path) {
+    
+    /**
+     * mknod()
+     */
+    public boolean mknod(String path) {
         try {
-            // don't overwrite by default
-            FSDataOutputStream output = dfs.create(new Path(path), false);
-
-            return new HdfsFileIoContext(output);
+            return dfs.createNewFile(new Path(path));
         } catch(IOException ioe) {
             // fall through to failure
         }
-
-        return null;
+        return false;
+    }
+    
+    
+    /**
+     * mkdir()
+     */
+    public boolean mkdir(String path) {
+        try {
+            return dfs.mkdirs(new Path(path));
+        } catch(IOException ioe) {
+            // fall through to failure
+        }
+        return false;
     }
 
     public boolean close(Object hdfsFile) {
@@ -158,8 +196,8 @@ class HdfsClientReal implements HdfsClient {
             }
 
             if(file.ioStream instanceof FSDataInputStream) {
-                FSDataInputStream output = (FSDataInputStream) file.ioStream;
-                output.close();
+                FSDataInputStream input = (FSDataInputStream) file.ioStream;
+                input.close();
                 return true;
             }
         } catch(IOException ioe) {
@@ -187,12 +225,16 @@ class HdfsClientReal implements HdfsClient {
         try {
             bytesRead = input.read(offset, readBuf, 0, readBuf.length);
         } catch(IOException ioe) {
+        	ioe.printStackTrace();
             return false;
         }
 
         // otherwise return how much we read
-        // TODO: does this handle 0 bytes?
+        if(bytesRead == -1)
+        	bytesRead = 0;
+        
         buf.put(readBuf, 0, bytesRead);
+        
         return true;
     }
 
@@ -240,23 +282,11 @@ class HdfsClientReal implements HdfsClient {
     }
 
     /**
-     * mkdir()
-     */
-    public boolean mkdir(String path) {
-        try {
-            return dfs.mkdirs(new Path(path));
-        } catch(IOException ioe) {
-            // fall through to failure
-        }
-        return false;
-    }
-
-    /**
      * unlink()
      */
     public boolean unlink(String filePath) {
         try {
-            return dfs.delete(new Path(filePath));
+            return dfs.delete(new Path(filePath), false);
         } catch(IOException ioe) {
             // fall through to failure
         }
@@ -267,7 +297,12 @@ class HdfsClientReal implements HdfsClient {
      * rmdir()
      */
     public boolean rmdir(String dirPath) {
-        return unlink(dirPath);
+        try {
+            return dfs.delete(new Path(dirPath), true);
+        } catch(IOException ioe) {
+            // fall through to failure
+        }
+        return false;
     }
 
     /**
@@ -281,6 +316,31 @@ class HdfsClientReal implements HdfsClient {
         }
         return false;
     }
+
+    public boolean statfs(FuseStatfsSetter statfsSetter, int blockSize, int namelen) {
+        try {
+            FsStatus fs = dfs.getStatus();
+            ContentSummary cs = dfs.getContentSummary(new Path("/"));
+            
+            statfsSetter.set(
+                    blockSize,
+                    (int)(fs.getCapacity()/blockSize),
+                    (int)(fs.getRemaining()/blockSize),
+                    (int)(fs.getRemaining()/blockSize),
+                    (int)cs.getFileCount(),
+                    0,
+                    namelen
+            );
+            
+            return true;
+        } catch(IOException ioe) {
+            ioe.printStackTrace();
+            // fall through to failure
+        }
+        
+        return false;
+    }
+    
 }
 
 //
@@ -288,12 +348,11 @@ class HdfsClientReal implements HdfsClient {
 
 //
 class HdfsFileIoContext {
-    public Object ioStream = null;
+    public Object ioStream;
+    public long offsetWritten;
 
-    public long offsetWritten = 0;
-
-    HdfsFileIoContext(Object ioStream) {
+    HdfsFileIoContext(Object ioStream, long len) {
         this.ioStream = ioStream;
-        offsetWritten = 0;
+        offsetWritten = len;
     }
 }
